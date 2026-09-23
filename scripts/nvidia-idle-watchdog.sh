@@ -24,8 +24,9 @@ if [[ ! "${POWER_THRESHOLD_W:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
     echo "POWER_THRESHOLD_W must be a positive number" >&2
     exit 1
 fi
-if [[ ! "${REQUIRED_PROBES:-}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "REQUIRED_PROBES must be a positive integer" >&2
+if [[ ! "${REQUIRED_PROBES:-}" =~ ^[1-9][0-9]*$ ]] ||
+   (( ${#REQUIRED_PROBES} > 10 )) || (( REQUIRED_PROBES > 2147483647 )); then
+    echo "REQUIRED_PROBES must be an integer between 1 and 2147483647" >&2
     exit 1
 fi
 
@@ -42,25 +43,25 @@ trim() {
 }
 
 eligible() {
-    local gpu_list gpu_data pstate power utilization extra processes
-    if ! gpu_list="$(nvidia-smi --query-gpu=uuid --format=csv,noheader,nounits)"; then
-        echo "Could not list NVIDIA GPUs" >&2
-        return 2
-    fi
-    if [[ -z "$gpu_list" || "$(printf '%s\n' "$gpu_list" | awk 'END { print NR }')" != 1 ]]; then
-        echo "Exactly one NVIDIA GPU is required" >&2
-        return 2
-    fi
-
-    if ! gpu_data="$(nvidia-smi --query-gpu=pstate,power.draw,utilization.gpu --format=csv,noheader,nounits)"; then
+    local gpu_data uuid pstate power utilization processes
+    if ! gpu_data="$(nvidia-smi --query-gpu=uuid,pstate,power.draw,utilization.gpu --format=csv,noheader,nounits)"; then
         echo "Could not read NVIDIA GPU state" >&2
         return 2
     fi
-    IFS=',' read -r pstate power utilization extra <<< "$gpu_data"
+    if [[ -z "$gpu_data" || "$gpu_data" == *$'\n'* ]]; then
+        echo "Exactly one NVIDIA GPU reading is required" >&2
+        return 2
+    fi
+    if [[ "${gpu_data//[^,]/}" != ',,,' ]]; then
+        echo "Malformed NVIDIA GPU reading" >&2
+        return 2
+    fi
+    IFS=',' read -r uuid pstate power utilization <<< "$gpu_data"
+    uuid="$(trim "${uuid:-}")"
     pstate="$(trim "${pstate:-}")"
     power="$(trim "${power:-}")"
     utilization="$(trim "${utilization:-}")"
-    if [[ -n "${extra:-}" || "$pstate" != P[0-9]* ||
+    if [[ "$uuid" != GPU-?* || "$pstate" != P[0-9]* ||
           ! "$power" =~ ^[0-9]+([.][0-9]+)?$ ||
           ! "$utilization" =~ ^[0-9]+$ ]]; then
         echo "Malformed NVIDIA GPU reading" >&2
@@ -83,8 +84,13 @@ eligible() {
 
 count=0
 if [[ -f "$STATE_FILE" ]]; then
-    read -r count < "$STATE_FILE" || true
-    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    count="$(< "$STATE_FILE")"
+    # Validate before arithmetic: leading zeroes mean octal in Bash, and
+    # oversized or stale values must not overflow or skip the probe interval.
+    if [[ ! "$count" =~ ^(0|[1-9][0-9]*)$ ]] ||
+       (( ${#count} > 10 )) || (( count >= REQUIRED_PROBES )); then
+        count=0
+    fi
 fi
 
 if eligible; then

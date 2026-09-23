@@ -9,11 +9,13 @@ mkdir -p "$test_dir/bin" "$test_dir/run"
 cat > "$test_dir/bin/nvidia-smi" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
-    --query-gpu=uuid)
-        printf '%s\n' "${MOCK_GPUS:-GPU-1}"
-        ;;
-    --query-gpu=pstate,power.draw,utilization.gpu)
-        printf '%s\n' "${MOCK_GPU_DATA:-P8, 32, 0}"
+    --query-gpu=uuid,pstate,power.draw,utilization.gpu)
+        if [[ -n "${MOCK_GPU_RECHECK_DATA:-}" && -f "$NIPW_RUN_DIR/queried" ]]; then
+            printf '%s\n' "$MOCK_GPU_RECHECK_DATA"
+        else
+            printf '%s\n' "${MOCK_GPU_DATA-GPU-1, P8, 32, 0}"
+        fi
+        touch "$NIPW_RUN_DIR/queried"
         ;;
     --query-compute-apps=pid)
         [[ "${MOCK_PROCESS_QUERY_FAIL:-0}" != 1 ]] || exit 1
@@ -52,8 +54,8 @@ export MOCK_FIX_LOG="$test_dir/fixes"
 
 reset_case() {
     printf 'MODE=%s\nPOWER_THRESHOLD_W=25\nREQUIRED_PROBES=2\n' "$1" > "$NIPW_CONFIG_FILE"
-    rm -f "$test_dir/run/nvidia-idle-power-bad-count" "$MOCK_FIX_LOG"
-    unset MOCK_GPUS MOCK_GPU_DATA MOCK_PROCESSES MOCK_SLEEP_FAIL MOCK_PROCESS_QUERY_FAIL
+    rm -f "$test_dir/run/nvidia-idle-power-bad-count" "$MOCK_FIX_LOG" "$test_dir/run/queried"
+    unset MOCK_GPU_DATA MOCK_GPU_RECHECK_DATA MOCK_PROCESSES MOCK_SLEEP_FAIL MOCK_PROCESS_QUERY_FAIL
     NIPW_FIX_SCRIPT="$test_dir/fix-ok"
     export NIPW_FIX_SCRIPT
 }
@@ -67,11 +69,11 @@ assert_fixes() {
 }
 
 reset_case strict
-MOCK_GPU_DATA='P8, 15, 0'; export MOCK_GPU_DATA
+MOCK_GPU_DATA='GPU-1, P8, 15, 0'; export MOCK_GPU_DATA
 probe; probe; assert_fixes 0
 
 reset_case strict
-MOCK_GPU_DATA='P8, 32, 10'; export MOCK_GPU_DATA
+MOCK_GPU_DATA='GPU-1, P8, 32, 10'; export MOCK_GPU_DATA
 probe; probe; assert_fixes 0
 
 reset_case strict
@@ -96,9 +98,41 @@ if probe; then echo 'Malformed reading unexpectedly succeeded' >&2; exit 1; fi
 assert_fixes 0
 
 reset_case strict
-MOCK_GPUS=$'GPU-1\nGPU-2'; export MOCK_GPUS
+MOCK_GPU_DATA=$'GPU-1, P8, 32, 0\nGPU-2, P0, 300, 100'; export MOCK_GPU_DATA
 if probe; then echo 'Multi-GPU reading unexpectedly succeeded' >&2; exit 1; fi
 assert_fixes 0
+
+for bad_reading in '' 'GPU-1, P8, 32' 'GPU-1, P8, 32, 0,' ', P8, 32, 0'; do
+    reset_case loaded-idle
+    MOCK_GPU_DATA="$bad_reading"; export MOCK_GPU_DATA
+    if probe; then echo 'Invalid reading unexpectedly succeeded' >&2; exit 1; fi
+    assert_fixes 0
+done
+
+# The initial reading is eligible, but a second GPU appears on the final check.
+reset_case strict
+printf '1\n' > "$test_dir/run/nvidia-idle-power-bad-count"
+MOCK_GPU_RECHECK_DATA=$'GPU-1, P8, 32, 0\nGPU-2, P0, 300, 100'; export MOCK_GPU_RECHECK_DATA
+if probe; then echo 'Invalid recheck unexpectedly succeeded' >&2; exit 1; fi
+assert_fixes 0
+[[ "$(< "$test_dir/run/nvidia-idle-power-bad-count")" == 0 ]]
+
+for bad_count in 08 09 000 -1 garbage 2 2147483648 999999999999999999999999999999 $'1\ngarbage'; do
+    reset_case strict
+    printf '%s\n' "$bad_count" > "$test_dir/run/nvidia-idle-power-bad-count"
+    probe
+    assert_fixes 0
+    [[ "$(< "$test_dir/run/nvidia-idle-power-bad-count")" == 1 ]]
+    probe
+    assert_fixes 1
+done
+
+for bad_limit in 08 2147483648 999999999999999999999999999999; do
+    reset_case strict
+    printf 'REQUIRED_PROBES=%s\n' "$bad_limit" >> "$NIPW_CONFIG_FILE"
+    if probe; then echo 'Invalid probe limit unexpectedly succeeded' >&2; exit 1; fi
+    assert_fixes 0
+done
 
 reset_case strict
 NIPW_FIX_SCRIPT="$test_dir/fix-fail"; export NIPW_FIX_SCRIPT
@@ -116,3 +150,4 @@ fi
 [[ "$(< "$NIPW_SUSPEND_PATH")" == resume ]]
 
 echo 'All stubbed watchdog tests passed.'
+bash "$repo_dir/tests/uninstall.sh"

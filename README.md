@@ -107,7 +107,7 @@ Choose these settings from your own GPU readings before enabling the timer:
 | --- | --- |
 | `MODE` | Use `strict` unless a model stays loaded while idle and you accept the risk of interrupting it; then use `loaded-idle`. |
 | `POWER_THRESHOLD_W` | Set a positive watt value above normal P8 idle power and below the persistent elevated reading. |
-| `REQUIRED_PROBES` | Set a positive integer for how many consecutive checks must match. Checks run every two minutes. |
+| `REQUIRED_PROBES` | Set an integer from 1 to 2147483647 for how many consecutive checks must match. Checks run every two minutes. |
 
 The [example configuration](config.example) uses `25` W and five probes chosen
 for one RTX 3090. These are not universal settings.
@@ -159,8 +159,10 @@ sudo systemctl disable --now nvidia-idle-power-watchdog.timer
 ```
 
 To uninstall, enter the cloned repository and run `sudo ./uninstall.sh`. This
-removes the program and units but retains the configuration for a later
-reinstall.
+disables the timer and waits up to 30 seconds for a running check to finish
+before removing the program and units. If the check is still running, it keeps
+the files in place; retry after the check finishes. The configuration remains
+for a later reinstall.
 
 ## Limits and recovery
 
