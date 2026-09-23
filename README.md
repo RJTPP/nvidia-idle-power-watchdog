@@ -1,34 +1,182 @@
 # NVIDIA Idle Power Watchdog
 
-A Linux/systemd workaround for a headless, single NVIDIA GPU that returns to
-P8 and zero reported utilization but keeps drawing more power than its normal
-idle level. A timer checks every two minutes. After a configurable number of
-consecutive high readings, the watchdog briefly writes `suspend` and `resume`
-to the NVIDIA driver interface.
+A Linux/systemd workaround for a headless host with one NVIDIA GPU whose power
+stays above its normal idle level after returning to P8. The watchdog checks
+every two minutes and uses a brief NVIDIA driver suspend/resume pulse if the
+high-power condition persists.
 
-This pulse is a community workaround, not an NVIDIA-supported fix for high
-idle power or its underlying cause. NVIDIA documents
-`/proc/driver/nvidia/suspend` for coordinated system power management. The
-watchdog requires root, refuses recovery if `nvidia-smi` reports more than one
-GPU, and could interrupt a workload.
+> [!CAUTION]
+> Use this only when the NVIDIA GPU is not driving a display. The tool runs as
+> root and briefly suspends the NVIDIA driver, which can interrupt GPU work or
+> display output. It does not suspend the operating system.
+
+The pulse is a community workaround, not an NVIDIA-supported fix for high idle
+power or its underlying cause. NVIDIA documents `/proc/driver/nvidia/suspend`
+for coordinated system power management.
 
 ## When this may help
 
-On a headless Proxmox host, elevated P8 idle power has appeared after Ollama,
-llama.cpp, and vLLM workloads. A [similar RTX 3090 report on the NVIDIA
-Developer Forums](https://forums.developer.nvidia.com/t/high-idle-power-consumption-in-headless-server-without-monitor-connected/311064/7)
-describes higher idle power after Ollama or llama.cpp use. A suspend/resume
-pulse lowered it even while a model remained loaded. Related symptoms were
-[reported after headless boot](https://forums.developer.nvidia.com/t/high-idle-power-consumption-in-headless-server-without-monitor-connected/311064)
-and [after a driver change on an RTX 3080 Ti](https://forums.developer.nvidia.com/t/increased-idle-consumption-with-driver-570/321460).
-The reports do not establish one cause or show that this watchdog helps in
-every case. The strongest matching experience is with a headless RTX 3090;
-other GPUs, drivers, and setups remain unverified for this project.
+Elevated P8 idle power has been reported in these situations:
+
+- **After compute workloads:** It has appeared after Ollama, llama.cpp, and
+  vLLM use on a headless Proxmox host. In a [similar headless RTX 3090
+  report](https://forums.developer.nvidia.com/t/high-idle-power-consumption-in-headless-server-without-monitor-connected/311064/7),
+  a suspend/resume pulse lowered idle power even with a model still loaded.
+- **After headless boot:** An [RTX 3090 report](https://forums.developer.nvidia.com/t/high-idle-power-consumption-in-headless-server-without-monitor-connected/311064)
+  describes elevated P8 power before a display was connected.
+- **After a driver change:** An [RTX 3080 Ti report](https://forums.developer.nvidia.com/t/increased-idle-consumption-with-driver-570/321460)
+  describes higher idle power after updating to driver 570.
+
+These reports do not establish one cause or show that the pulse helps in every
+case. The strongest matching experience is with a headless RTX 3090; other
+GPUs, drivers, and setups remain unverified for this project.
 
 Measure normal P8 idle power on your own GPU and setup, then compare readings
 after the workload settles. One high reading, P8, or zero reported utilization
 alone is not enough. In another [headless GPU report](https://forums.developer.nvidia.com/t/575-3090-idling-at-over-100-watts/339427),
 `nvidia-smi` monitoring itself changed the observed power behavior.
+
+## Test the pulse manually
+
+Before enabling the timer, check that `nvidia-smi -L` lists exactly one NVIDIA
+GPU. Choose a time when GPU work can be interrupted. Record its P8 power draw
+with this command:
+
+```bash
+nvidia-smi --query-gpu=pstate,power.draw,utilization.gpu --format=csv,noheader,nounits
+```
+
+If the GPU is in the elevated idle state, run these commands on the host:
+
+```bash
+printf 'suspend\n' | sudo tee /proc/driver/nvidia/suspend >/dev/null
+sleep 1
+printf 'resume\n' | sudo tee /proc/driver/nvidia/suspend >/dev/null
+```
+
+Take the same power reading again and confirm that the GPU still accepts work.
+These direct writes bypass the watchdog's GPU count and activity checks. If the
+resume write fails, inspect the driver and GPU state before proceeding. This
+test checks whether the pulse helps on your machine; it does not test the
+watchdog's automatic detection. If idle power does not improve, leave the timer
+disabled.
+
+## How it works
+
+Each timer run checks the GPU. The watchdog follows this path:
+
+```mermaid
+flowchart TD
+    A[Check GPU] --> B{Eligible reading?}
+    B -- No --> C[Reset count]
+    B -- Yes --> D[Increase count]
+    D --> E{Required probes reached?}
+    E -- No --> F[Wait for next timer run]
+    E -- Yes --> G{Still eligible on recheck?}
+    G -- No --> C
+    G -- Yes --> H[Driver suspend and resume]
+    H --> C
+```
+
+An eligible reading means P8, zero reported utilization, power above the
+configured threshold, and the mode-specific requirement below. The timer runs
+every two minutes.
+
+| Mode | Additional requirement | Use case |
+| --- | --- | --- |
+| `strict` (default) | No reported compute processes | Conservative automatic operation |
+| `loaded-idle` | None | A loaded model may remain resident |
+
+In `loaded-idle`, a request could start between the check and the driver
+operation. The strict mode checks compute processes reported by `nvidia-smi`.
+The watchdog uses locks to prevent overlapping recovery attempts.
+
+## Requirements
+
+- Linux, systemd, one headless NVIDIA GPU that is not driving a display, a
+  working NVIDIA driver, and `nvidia-smi`
+- Bash, `flock` (util-linux), `awk`, and `logger`
+- A writable `/proc/driver/nvidia/suspend` interface
+- A GPU that reaches P8 during normal idle periods
+
+## Install and configure
+
+Choose these settings from your own GPU readings before enabling the timer:
+
+| Setting | How to choose it |
+| --- | --- |
+| `MODE` | Use `strict` unless a model stays loaded while idle and you accept the risk of interrupting it; then use `loaded-idle`. |
+| `POWER_THRESHOLD_W` | Set a positive watt value above normal P8 idle power and below the persistent elevated reading. |
+| `REQUIRED_PROBES` | Set a positive integer for how many consecutive checks must match. Checks run every two minutes. |
+
+The [example configuration](config.example) uses `25` W and five probes chosen
+for one RTX 3090. These are not universal settings.
+
+The commands below follow five steps. They clone the repository, install the
+scripts and units, create a config only if one does not exist, open it for
+editing, and ask before enabling the timer. Check the values in the editor
+before answering `y`.
+
+```bash
+(
+  set -e
+  # 1. Get the repository.
+  git clone https://github.com/RJTPP/nvidia-idle-power-watchdog.git
+  cd nvidia-idle-power-watchdog
+
+  # 2. Install the scripts and systemd units. The timer remains disabled.
+  sudo ./install.sh
+
+  # 3. Keep an existing configuration; otherwise copy the example.
+  if [ ! -e /etc/default/nvidia-idle-power-watchdog ]; then
+    sudo install -m 0644 config.example /etc/default/nvidia-idle-power-watchdog
+  fi
+
+  # 4. Set the mode, power threshold, and required probe count.
+  sudoedit /etc/default/nvidia-idle-power-watchdog
+
+  # 5. Enable only after reviewing the configuration.
+  printf 'Enable the watchdog timer now? [y/N] '
+  read -r enable_timer
+  if [ "${enable_timer:-}" = y ] || [ "${enable_timer:-}" = Y ]; then
+    sudo systemctl enable --now nvidia-idle-power-watchdog.timer
+  fi
+)
+```
+
+The watchdog sources the config as a shell file, so keep the installed file
+root-controlled. It needs no network access or external service. For commands
+that install and remove the files without either helper script, see the
+[manual installation guide](docs/manual-install.md).
+
+## Observe and roll back
+
+```bash
+systemctl status nvidia-idle-power-watchdog.timer
+journalctl -t nvidia-idle-power-watchdog -b
+journalctl -u nvidia-idle-power-watchdog.service -b
+sudo systemctl disable --now nvidia-idle-power-watchdog.timer
+```
+
+To uninstall, enter the cloned repository and run `sudo ./uninstall.sh`. This
+removes the program and units but retains the configuration for a later
+reinstall.
+
+## Limits and recovery
+
+- The NVIDIA suspend interface acts on the driver, with no documented way to
+  select one GPU. The pulse might help on a multi-GPU host, but this project
+  has not tested that use. The watchdog refuses automatic recovery when
+  `nvidia-smi` reports more than one GPU.
+- A transient high-power reading cannot trigger recovery.
+- If `nvidia-smi` fails or returns invalid data, recovery does not run.
+- The recovery script attempts `resume` on exit if an error follows `suspend`.
+  If the driver does not recover, check the service log and GPU state before
+  trying again.
+- The two-minute interval can be changed with a systemd timer override.
+
+NVIDIA's [power-management documentation](https://download.nvidia.com/XFree86/Linux-x86_64/535.216.01/README/powermanagement.html)
+describes the intended suspend interface and its requirements.
 
 ### Other approaches to check
 
@@ -45,77 +193,8 @@ alone is not enough. In another [headless GPU report](https://forums.developer.n
 These options address different situations; none is required to install the
 watchdog.
 
-## Requirements
-
-- Linux, systemd, one NVIDIA GPU, a working NVIDIA driver and `nvidia-smi`
-- Bash, `flock` (util-linux), `awk`, and `logger`
-- A writable `/proc/driver/nvidia/suspend` interface
-- A GPU that reaches P8 during normal idle periods
-
-## Install
-
-```bash
-sudo ./install.sh
-sudo install -m 0644 config.example /etc/default/nvidia-idle-power-watchdog
-sudoedit /etc/default/nvidia-idle-power-watchdog
-sudo systemctl enable --now nvidia-idle-power-watchdog.timer
-```
-
-The installer leaves the timer disabled and does not set a threshold. Keep an
-existing configuration instead of replacing it with the example. Its `25` W
-threshold and five probes were chosen for one RTX 3090, not as universal
-settings. Measure your normal P8 idle power and set the threshold above it
-before enabling the timer.
-
-```bash
-nvidia-smi --query-gpu=pstate,power.draw,utilization.gpu --format=csv,noheader,nounits
-```
-
-The watchdog uses one of two modes:
-
-| Mode | Recovery requires | Use case |
-| --- | --- | --- |
-| `strict` (default) | P8, zero reported utilization, power above threshold, and no reported compute processes | Conservative automatic operation |
-| `loaded-idle` | P8, zero reported utilization, and power above threshold | A loaded model may remain resident |
-
-Both modes require consecutive matching probes and recheck immediately before
-recovery. In `loaded-idle`, a request could start between the check and the
-driver operation. The strict mode checks compute processes reported by
-`nvidia-smi`; the watchdog is intended for headless compute hosts.
-
-Use only a root-controlled installed configuration: the watchdog sources it as
-a shell file. It needs no network access or external service.
-
-## Observe and roll back
-
-```bash
-systemctl status nvidia-idle-power-watchdog.timer
-journalctl -t nvidia-idle-power-watchdog -b
-journalctl -u nvidia-idle-power-watchdog.service -b
-sudo systemctl disable --now nvidia-idle-power-watchdog.timer
-```
-
-`sudo ./uninstall.sh` removes the program and units but retains the
-configuration for a later reinstall.
-
-## Limits and recovery
-
-- The NVIDIA suspend interface affects the driver, not an individual GPU.
-  This version supports exactly one GPU.
-- A normal or busy reading, or a recovery attempt, resets the high-power
-  counter. A transient reading cannot trigger recovery.
-- If `nvidia-smi` fails or returns invalid data, recovery does not run.
-- The recovery script attempts `resume` on exit if an error follows `suspend`.
-  If the driver does not recover, check the service log and GPU state before
-  trying again.
-- The two-minute interval can be changed with a systemd timer override.
-
-NVIDIA's [power-management documentation](https://download.nvidia.com/XFree86/Linux-x86_64/535.216.01/README/powermanagement.html)
-describes the intended suspend interface and its requirements.
-
 ## Test
 
 `bash tests/test.sh` uses stubbed GPU readings and a temporary fake suspend
-interface. It never accesses a real GPU. The workaround has been used on a
-Proxmox host, but this standalone port has not been tested against a live GPU
-or validated for installation and recovery there.
+interface. It never accesses a real GPU. This watchdog has also been used on a
+Proxmox host; behavior may vary with the GPU and driver.
