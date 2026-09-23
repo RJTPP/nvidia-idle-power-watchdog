@@ -1,0 +1,5 @@
+# Example for a headless, single-GPU RTX 3090 host. Tune after measuring
+# your own GPU's normal idle power. These values are not universal defaults.
+MODE=strict
+POWER_THRESHOLD_W=25
+REQUIRED_PROBES=5

@@ -1,0 +1,6 @@
+[Unit]
+Description=Check for NVIDIA high-power idle state
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/nvidia-idle-power-watchdog/nvidia-idle-watchdog.sh
